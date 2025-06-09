@@ -1,3 +1,4 @@
+// main.go
 package main
 
 import (
@@ -11,68 +12,77 @@ import (
 func main() {
 	fmt.Println("Shamir's Secret Sharing Example")
 
-	// Example 1: Basic Split and Combine
 	splitCombine()
-
-	// Example 2: Split and store shares in different storage backends
 	splitStorage()
 }
 
 func splitCombine() {
 	secret := []byte("Top Secret Message")
-	threshold, totalShares := 3, 5
-	shares, err := shamir.Split(secret, threshold, totalShares)
+	threshold, total := 3, 5
+
+	shares, err := shamir.Split(secret, threshold, total)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("Generated %d shares, threshold %d:\n", totalShares, threshold)
+	fmt.Printf("Generated %d shares (threshold %d):\n", total, threshold)
 	for _, s := range shares {
-		fmt.Printf("Share %d: %x\n", s[0], s[1:])
+		fmt.Printf(" • #%d → %x\n", s[9], s[10:]) // skip header bytes
 	}
 
-	recovered, err := shamir.Combine(shares, threshold)
+	recovered, err := shamir.Combine(shares)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("Recovered secret: %s\n", string(recovered))
+	fmt.Printf("Recovered: %s\n\n", string(recovered))
 }
 
 func splitStorage() {
-	secret := []byte("Top Secret Message")
-	threshold, totalShares := 3, 5
-	shares, err := shamir.Split(secret, threshold, totalShares)
+	secret := []byte("Another Secret")
+	threshold, total := 3, 5
+
+	shares, err := shamir.Split(secret, threshold, total)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("Generated %d shares, threshold %d:\n", totalShares, threshold)
-	for _, s := range shares {
-		fmt.Printf("Share %d: %x\n", s[0], s[1:])
-	}
 
-	// Demonstration: Distribute shares into different storage backends using MultiStorage.
-	ms := storage.New()
-	store, err := drivers.NewFileStorage("./.enc") // each share gets its own backend in this example
+	// Setup MultiStorage with mixed backends
+	ms := storage.NewMultiStorage()
+	mem := drivers.NewMemoryStorage()
+	file, err := drivers.NewFileStorage("./shares")
 	if err != nil {
 		panic(err)
 	}
-	// Assign a dedicated storage backend (MemoryStorage) for each share.
-	for _, share := range shares {
 
-		ms.AssignStorage(share[0], store)
+	// Assign alternating backends
+	for i, s := range shares {
+		idx := s[9]
+		if i%2 == 0 {
+			ms.AssignStorage(idx, mem)
+		} else {
+			ms.AssignStorage(idx, file)
+		}
 	}
-	// Store shares in their designated storage backends.
+
+	// Store all shares
 	if err := storage.StoreSharesMulti(shares, ms); err != nil {
 		panic(err)
 	}
-	// Retrieve stored share indices.
-	indices, err := ms.ListShares()
+
+	// List stored indices
+	indices, _ := ms.ListShares()
+	fmt.Printf("Stored share indices: %v\n", indices)
+
+	// Retrieve any threshold shares
+	sub := indices[:threshold]
+	recs, err := storage.RetrieveSharesMulti(sub, ms)
 	if err != nil {
 		panic(err)
 	}
-	// Reconstruct the secret using multi-party authorization from distributed storage.
-	recovered, err := shamir.MultiPartyAuthorize(ms, indices, threshold)
+
+	// Reconstruct
+	secret2, err := shamir.Combine(recs)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("Recovered from MultiStorage: %s\n", string(recovered))
+	fmt.Printf("Reconstructed from storage: %s\n", string(secret2))
 }

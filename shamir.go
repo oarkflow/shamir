@@ -2,59 +2,42 @@ package shamir
 
 import (
 	"crypto/rand"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
-
-	"github.com/oarkflow/shamir/storage"
+	"hash/crc32"
+	"io"
+	"sync"
 )
 
-// Precomputed tables for GF(256) arithmetic using the polynomial x^8 + x^4 + x^3 + x + 1 (0x11b)
+// --- GF(256) arithmetic tables & operations --------------------------------
+
+// Precomputed tables for GF(256) arithmetic using polynomial 0x11b
 var (
 	expTable [512]byte
 	logTable [256]byte
 )
 
 func init() {
-	// initialize exp and log tables
 	var x byte = 1
 	for i := 0; i < 255; i++ {
 		expTable[i] = x
 		logTable[x] = byte(i)
 		x = gfMulNoLUT(x, 0x03)
 	}
-	// duplicate for easy reduction
+	// duplicate to avoid mod operations
 	for i := 255; i < 512; i++ {
 		expTable[i] = expTable[i-255]
 	}
 }
 
-// Add two field elements (XOR)
-func add(a, b byte) byte {
-	return a ^ b
-}
-
-// Subtraction is the same as addition in GF(256)
-func sub(a, b byte) byte {
-	return a ^ b
-}
-
-// Multiply using lookup tables
-func mul(a, b byte) byte {
-	if a == 0 || b == 0 {
-		return 0
-	}
-	s := int(logTable[a]) + int(logTable[b])
-	// mod 255
-	if s >= 255 {
-		s -= 255
-	}
-	return expTable[s]
-}
-
-// gfMulNoLUT is a simple bitwise multiplication used to generate tables
+// bitwise multiplication for table generation
 func gfMulNoLUT(a, b byte) byte {
 	var p byte
 	for b > 0 {
-		if (b & 1) != 0 {
+		if b&1 != 0 {
 			p ^= a
 		}
 		carry := a & 0x80
@@ -67,175 +50,322 @@ func gfMulNoLUT(a, b byte) byte {
 	return p
 }
 
-// Inverse using tables
+// Add and Sub are XOR
+func add(a, b byte) byte { return a ^ b }
+func sub(a, b byte) byte { return a ^ b }
+
+// Multiply using exp/log tables
+func mul(a, b byte) byte {
+	if a == 0 || b == 0 {
+		return 0
+	}
+	s := int(logTable[a]) + int(logTable[b])
+	if s >= 255 {
+		s -= 255
+	}
+	return expTable[s]
+}
+
+// Inverse in GF(256)
 func inv(a byte) (byte, error) {
 	if a == 0 {
 		return 0, errors.New("shamir: inverse of zero")
 	}
-	// 255 - log(a)
 	return expTable[255-int(logTable[a])], nil
 }
 
-// Split divides a secret byte slice into `n` shares, requiring `t` shares to reconstruct.
-// Each share is a byte slice of length len(secret)+1, where the first byte is the share index (1..255).
+// --- Constants, pools, interfaces ------------------------------------------
+
+const (
+	magicHeader = "SHAM" // 4 bytes
+	version     = 1      // 1 byte
+)
+
+var (
+	// pool for coefficient buffers to reduce allocations
+	coeffPool = sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, 256)
+			return &buf
+		},
+	}
+)
+
+// IStorage defines storage operations for shares.
+type IStorage interface {
+	SetShare(index byte, share []byte) error
+	GetShare(index byte) ([]byte, error)
+	ListShares() ([]byte, error)
+	DeleteShare(index byte) error
+	BatchSet(shares map[byte][]byte) error
+}
+
+// ShareJSON is the portable JSON form of a share.
+type ShareJSON struct {
+	Index       byte   `json:"index"`
+	Threshold   byte   `json:"threshold"`
+	TotalShares byte   `json:"total_shares"`
+	Data        string `json:"data"` // base64-encoded payload
+}
+
+// --- Split & Combine -------------------------------------------------------
+
+// Split splits the secret into n shares requiring t to reconstruct.
 func Split(secret []byte, t, n int) ([][]byte, error) {
+	return SplitWithReader(rand.Reader, secret, t, n)
+}
+
+// SplitWithReader allows custom RNG (for testing).
+func SplitWithReader(rng io.Reader, secret []byte, t, n int) ([][]byte, error) {
 	if t < 2 || t > 255 {
 		return nil, errors.New("shamir: threshold must be between 2 and 255")
 	}
 	if n < t || n > 255 {
 		return nil, errors.New("shamir: number of shares must be between threshold and 255")
 	}
-	// generate coefficients: a_0 = secret byte, a_1..a_{t-1} random
+	secretLen := len(secret)
+	// header = magic(4)+ver(1)+thr(1)+tot(1)+len(2)+idx(1)
+	const headLen = 4 + 1 + 1 + 1 + 2 + 1
+
 	shares := make([][]byte, n)
 	for i := range shares {
-		// allocate extra byte for total shares header
-		shares[i] = make([]byte, len(secret)+2)
-		shares[i][0] = byte(i + 1) // share (chunk) index (x coordinate)
-		shares[i][1] = byte(n)     // total shares/chunks
+		buf := make([]byte, headLen+secretLen+4) // +4 for CRC32
+		copy(buf[0:], []byte(magicHeader))
+		buf[4] = version
+		buf[5] = byte(t)
+		buf[6] = byte(n)
+		binary.BigEndian.PutUint16(buf[7:], uint16(secretLen))
+		buf[9] = byte(i + 1) // index from 1..n
+		shares[i] = buf
 	}
-	// for each byte in secret, generate polynomial
-	for j := 0; j < len(secret); j++ {
-		// random coefficients
-		coeffs := make([]byte, t)
+
+	// for each secret byte, build polynomial and evaluate
+	for j := 0; j < secretLen; j++ {
+		pb := coeffPool.Get().(*[]byte)
+		coeffs := (*pb)[:t]
 		coeffs[0] = secret[j]
-		_, err := rand.Read(coeffs[1:])
-		if err != nil {
+		if _, err := io.ReadFull(rng, coeffs[1:]); err != nil {
 			return nil, err
 		}
-		// evaluate polynomial at each x
 		for i := 0; i < n; i++ {
-			x := shares[i][0]
+			x := shares[i][9]
 			var y byte = coeffs[0]
-			var powX byte = 1
+			var px byte = 1
 			for k := 1; k < t; k++ {
-				powX = mul(powX, x)
-				y = add(y, mul(coeffs[k], powX))
+				px = mul(px, x)
+				y ^= mul(coeffs[k], px)
 			}
-			shares[i][j+2] = y // changed offset to +2 for header
+			shares[i][headLen+j] = y
 		}
+		// zero out and return buffer
+		for k := range coeffs {
+			coeffs[k] = 0
+		}
+		coeffPool.Put(pb)
 	}
+
+	// append CRC32
+	for _, buf := range shares {
+		d := buf[:headLen+secretLen]
+		crc := crc32.ChecksumIEEE(d)
+		binary.BigEndian.PutUint32(buf[len(buf)-4:], crc)
+	}
+
 	return shares, nil
 }
 
-// Combine reconstructs the secret from at least `t` shares.
-func Combine(shares [][]byte, t int) ([]byte, error) {
-	// Validate that we have at least t shares.
-	if len(shares) < t {
-		return nil, errors.New("shamir: insufficient shares for threshold")
+// Combine reconstructs the secret from exactly t shares.
+func Combine(shares [][]byte) ([]byte, error) {
+	t := len(shares)
+	if t < 2 {
+		return nil, errors.New("shamir: need at least 2 shares")
 	}
-	if len(shares) > t {
-		shares = shares[:t]
-	}
-	n := t
 
-	// all shares must have same length and valid header
-	length := len(shares[0])
-	totalSharesHeader := shares[0][1]
-	xs := make([]byte, n)
-	used := make(map[byte]bool)
-	for i, s := range shares {
-		if len(s) != length {
-			return nil, errors.New("shamir: mismatched share lengths")
-		}
-		// Validate total shares header consistency
-		if s[1] != totalSharesHeader {
-			return nil, errors.New("shamir: inconsistent total shares header")
-		}
-		xi := s[0]
-		if xi == 0 {
-			return nil, errors.New("shamir: share index cannot be zero")
-		}
-		if used[xi] {
-			return nil, errors.New("shamir: duplicate share indices detected")
-		}
-		used[xi] = true
-		xs[i] = xi
+	// parse header of first share
+	h := shares[0]
+	if len(h) < 10 {
+		return nil, errors.New("shamir: invalid share length")
 	}
-	// Precompute product of all x coordinates: productAll = ∏ xi
-	productAll := byte(1)
-	for _, xi := range xs {
-		productAll = mul(productAll, xi)
+	if string(h[0:4]) != magicHeader {
+		return nil, errors.New("shamir: bad magic header")
 	}
-	// Precompute Lagrange coefficients l_i = (productAll / xi) * inv(∏_{j≠i}(xi - xj))
-	lags := make([]byte, n)
-	for i := 0; i < n; i++ {
-		denom := byte(1)
-		for j := 0; j < n; j++ {
+	if h[4] != version {
+		return nil, errors.New("shamir: version mismatch")
+	}
+	threshold := int(h[5])
+	total := h[6]
+	secretLen := int(binary.BigEndian.Uint16(h[7:9]))
+	const headLen = 4 + 1 + 1 + 1 + 2 + 1
+
+	// Modified check: accept at least threshold shares.
+	if t < threshold {
+		return nil, errors.New("shamir: insufficient shares provided")
+	} else if t > threshold {
+		// Use first threshold shares if more provided.
+		shares = shares[:threshold]
+		t = threshold
+	}
+
+	xs := make([]byte, t)
+	data := make([][]byte, t)
+	seen := make(map[byte]bool, t)
+
+	for i, buf := range shares {
+		if len(buf) != headLen+secretLen+4 {
+			return nil, errors.New("shamir: share length mismatch")
+		}
+		// CRC check
+		end := len(buf)
+		expected := binary.BigEndian.Uint32(buf[end-4:])
+		if crc32.ChecksumIEEE(buf[:end-4]) != expected {
+			return nil, errors.New("shamir: CRC32 mismatch")
+		}
+		if buf[5] != byte(threshold) || buf[6] != total {
+			return nil, errors.New("shamir: inconsistent header fields")
+		}
+		x := buf[9]
+		if x == 0 || seen[x] {
+			return nil, errors.New("shamir: invalid or duplicate index")
+		}
+		seen[x] = true
+		xs[i] = x
+		data[i] = buf[headLen : headLen+secretLen]
+	}
+
+	// compute Lagrange weights
+	prodAll := byte(1)
+	for _, x := range xs {
+		prodAll = mul(prodAll, x)
+	}
+	lags := make([]byte, t)
+	for i := 0; i < t; i++ {
+		d := byte(1)
+		for j := 0; j < t; j++ {
 			if i == j {
 				continue
 			}
-			denom = mul(denom, sub(xs[i], xs[j]))
+			d = mul(d, xs[i]^xs[j])
 		}
-		invXS, err := inv(xs[i])
-		if err != nil {
-			return nil, err
-		}
-		invDenom, err := inv(denom)
-		if err != nil {
-			return nil, err
-		}
-		lags[i] = mul(mul(productAll, invXS), invDenom)
+		i1, _ := inv(xs[i])
+		d1, _ := inv(d)
+		lags[i] = mul(mul(prodAll, i1), d1)
 	}
-	secret := make([]byte, length-2)
-	// For each byte position in secret part, apply precomputed Lagrange coefficients
-	for j := 2; j < length; j++ {
-		var value byte = 0
-		for i := 0; i < n; i++ {
-			yi := shares[i][j]
-			value = add(value, mul(yi, lags[i]))
+
+	// reconstruct secret
+	secret := make([]byte, secretLen)
+	for j := 0; j < secretLen; j++ {
+		var v byte
+		for i := 0; i < t; i++ {
+			v ^= mul(data[i][j], lags[i])
 		}
-		secret[j-2] = value
+		secret[j] = v
 	}
 	return secret, nil
 }
 
-// StoreShares stores all provided shares into the given storage.
-func StoreShares(shares [][]byte, storage storage.IStorage) error {
-	for _, share := range shares {
-		index := share[0]
-		if err := storage.SetShare(index, share); err != nil {
-			return err
-		}
+// --- Storage helpers -------------------------------------------------------
+
+// StoreShares saves all shares to the given storage.
+func StoreShares(shares [][]byte, st IStorage) error {
+	batch := make(map[byte][]byte, len(shares))
+	for _, s := range shares {
+		batch[s[9]] = s
 	}
-	return nil
+	return st.BatchSet(batch)
 }
 
-// RetrieveShares gets shares from storage based on a list of indices.
-func RetrieveShares(indices []byte, storage storage.IStorage) ([][]byte, error) {
-	var shares [][]byte
+// RetrieveShares fetches specific shares by indices.
+func RetrieveShares(indices []byte, st IStorage) ([][]byte, error) {
+	var out [][]byte
 	for _, idx := range indices {
-		share, err := storage.GetShare(idx)
+		s, err := st.GetShare(idx)
 		if err != nil {
 			return nil, err
 		}
-		shares = append(shares, share)
+		out = append(out, s)
 	}
-	return shares, nil
+	return out, nil
 }
 
-// MultiPartyAuthorize retrieves shares from storage and combines them if the threshold is met.
-// This enforces that a quorum of custodians must collaborate to reconstruct the secret.
-func MultiPartyAuthorize(storage storage.IStorage, indices []byte, threshold int) ([]byte, error) {
-	shares, err := RetrieveShares(indices, storage)
+// MultiPartyAuthorize retrieves and combines shares for quorum.
+func MultiPartyAuthorize(st IStorage, indices []byte, threshold int) ([]byte, error) {
+	shs, err := RetrieveShares(indices, st)
 	if err != nil {
 		return nil, err
 	}
-	if len(shares) < threshold {
-		return nil, errors.New("shamir: insufficient shares for multi-party authorization")
+	if len(shs) < threshold {
+		return nil, errors.New("shamir: insufficient shares for threshold")
 	}
-	// Combine using only the first 'threshold' shares if extra are provided.
-	return Combine(shares, threshold)
+	return Combine(shs[:threshold])
 }
 
-// BreakGlassRecovery demonstrates recovery using pre-designated "break-glass" shares.
-// In practice, these shares should be stored in entirely separate secure locations.
-func BreakGlassRecovery(storage storage.IStorage, recoveryIndices []byte, threshold int) ([]byte, error) {
-	shares, err := RetrieveShares(recoveryIndices, storage)
+// BreakGlassRecovery uses a separate set of recovery shares.
+func BreakGlassRecovery(st IStorage, indices []byte, threshold int) ([]byte, error) {
+	return MultiPartyAuthorize(st, indices, threshold)
+}
+
+// --- Serialization ---------------------------------------------------------
+
+// EncodeBase64 returns a base64 string of a raw share.
+func EncodeBase64(share []byte) string {
+	return base64.StdEncoding.EncodeToString(share)
+}
+
+// DecodeBase64 parses a base64 share.
+func DecodeBase64(s string) ([]byte, error) {
+	return base64.StdEncoding.DecodeString(s)
+}
+
+// EncodeHex returns a hex string of a raw share.
+func EncodeHex(share []byte) string {
+	return hex.EncodeToString(share)
+}
+
+// DecodeHex parses a hex-encoded share.
+func DecodeHex(s string) ([]byte, error) {
+	return hex.DecodeString(s)
+}
+
+// ToJSON converts a share into JSON form.
+func ToJSON(share []byte) (string, error) {
+	if len(share) < 10 {
+		return "", errors.New("shamir: invalid share")
+	}
+	thr := share[5]
+	tot := share[6]
+	idx := share[9]
+	body := share[9 : len(share)-4]
+	j := ShareJSON{
+		Index:       idx,
+		Threshold:   thr,
+		TotalShares: tot,
+		Data:        base64.StdEncoding.EncodeToString(body),
+	}
+	b, err := json.Marshal(j)
+	return string(b), err
+}
+
+// FromJSON parses JSON back into a raw share.
+func FromJSON(js string) ([]byte, error) {
+	var j ShareJSON
+	if err := json.Unmarshal([]byte(js), &j); err != nil {
+		return nil, err
+	}
+	data, err := base64.StdEncoding.DecodeString(j.Data)
 	if err != nil {
 		return nil, err
 	}
-	if len(shares) < threshold {
-		return nil, errors.New("shamir: insufficient recovery shares for break-glass procedure")
-	}
-	return Combine(shares, threshold)
+	secretLen := len(data)
+	const headLen = 4 + 1 + 1 + 1 + 2 + 1
+	buf := make([]byte, headLen+secretLen+4)
+	copy(buf[0:], []byte(magicHeader))
+	buf[4] = version
+	buf[5] = j.Threshold
+	buf[6] = j.TotalShares
+	binary.BigEndian.PutUint16(buf[7:], uint16(secretLen))
+	buf[9] = j.Index
+	copy(buf[10:], data)
+	crc := crc32.ChecksumIEEE(buf[:len(buf)-4])
+	binary.BigEndian.PutUint32(buf[len(buf)-4:], crc)
+	return buf, nil
 }
