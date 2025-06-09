@@ -9,6 +9,35 @@ import (
 )
 
 func main() {
+	fmt.Println("Shamir's Secret Sharing Example")
+
+	// Example 1: Basic Split and Combine
+	splitCombine()
+
+	// Example 2: Split and store shares in different storage backends
+	splitStorage()
+}
+
+func splitCombine() {
+	secret := []byte("Top Secret Message")
+	threshold, totalShares := 3, 5
+	shares, err := shamir.Split(secret, threshold, totalShares)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("Generated %d shares, threshold %d:\n", totalShares, threshold)
+	for _, s := range shares {
+		fmt.Printf("Share %d: %x\n", s[0], s[1:])
+	}
+
+	recovered, err := shamir.Combine(shares, threshold)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("Recovered secret: %s\n", string(recovered))
+}
+
+func splitStorage() {
 	secret := []byte("Top Secret Message")
 	threshold, totalShares := 3, 5
 	shares, err := shamir.Split(secret, threshold, totalShares)
@@ -22,7 +51,7 @@ func main() {
 
 	// Demonstration: Distribute shares into different storage backends using MultiStorage.
 	ms := storage.New()
-	store, err := drivers.NewFileStorage("./enc") // each share gets its own backend in this example
+	store, err := drivers.NewFileStorage("./.enc") // each share gets its own backend in this example
 	if err != nil {
 		panic(err)
 	}
