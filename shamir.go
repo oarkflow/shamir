@@ -12,7 +12,8 @@ import (
 	"sync"
 )
 
-// --- GF(256) arithmetic tables & operations --------------------------------
+// header = magic(4)+ver(1)+thr(1)+tot(1)+len(2)+idx(1)
+const headLen = 10
 
 // Precomputed tables for GF(256) arithmetic using polynomial 0x11b
 var (
@@ -50,10 +51,6 @@ func gfMulNoLUT(a, b byte) byte {
 	return p
 }
 
-// Add and Sub are XOR
-func add(a, b byte) byte { return a ^ b }
-func sub(a, b byte) byte { return a ^ b }
-
 // Multiply using exp/log tables
 func mul(a, b byte) byte {
 	if a == 0 || b == 0 {
@@ -73,8 +70,6 @@ func inv(a byte) (byte, error) {
 	}
 	return expTable[255-int(logTable[a])], nil
 }
-
-// --- Constants, pools, interfaces ------------------------------------------
 
 const (
 	magicHeader = "SHAM" // 4 bytes
@@ -108,8 +103,6 @@ type ShareJSON struct {
 	Data        string `json:"data"` // base64-encoded payload
 }
 
-// --- Split & Combine -------------------------------------------------------
-
 // Split splits the secret into n shares requiring t to reconstruct.
 func Split(secret []byte, t, n int) ([][]byte, error) {
 	return SplitWithReader(rand.Reader, secret, t, n)
@@ -124,13 +117,10 @@ func SplitWithReader(rng io.Reader, secret []byte, t, n int) ([][]byte, error) {
 		return nil, errors.New("shamir: number of shares must be between threshold and 255")
 	}
 	secretLen := len(secret)
-	// header = magic(4)+ver(1)+thr(1)+tot(1)+len(2)+idx(1)
-	const headLen = 4 + 1 + 1 + 1 + 2 + 1
-
 	shares := make([][]byte, n)
 	for i := range shares {
 		buf := make([]byte, headLen+secretLen+4) // +4 for CRC32
-		copy(buf[0:], []byte(magicHeader))
+		copy(buf[0:], magicHeader)
 		buf[4] = version
 		buf[5] = byte(t)
 		buf[6] = byte(n)
@@ -138,7 +128,6 @@ func SplitWithReader(rng io.Reader, secret []byte, t, n int) ([][]byte, error) {
 		buf[9] = byte(i + 1) // index from 1..n
 		shares[i] = buf
 	}
-
 	// for each secret byte, build polynomial and evaluate
 	for j := 0; j < secretLen; j++ {
 		pb := coeffPool.Get().(*[]byte)
@@ -163,7 +152,6 @@ func SplitWithReader(rng io.Reader, secret []byte, t, n int) ([][]byte, error) {
 		}
 		coeffPool.Put(pb)
 	}
-
 	// append CRC32
 	for _, buf := range shares {
 		d := buf[:headLen+secretLen]
@@ -180,8 +168,6 @@ func Combine(shares [][]byte) ([]byte, error) {
 	if t < 2 {
 		return nil, errors.New("shamir: need at least 2 shares")
 	}
-
-	// parse header of first share
 	h := shares[0]
 	if len(h) < 10 {
 		return nil, errors.New("shamir: invalid share length")
@@ -195,26 +181,19 @@ func Combine(shares [][]byte) ([]byte, error) {
 	threshold := int(h[5])
 	total := h[6]
 	secretLen := int(binary.BigEndian.Uint16(h[7:9]))
-	const headLen = 4 + 1 + 1 + 1 + 2 + 1
-
-	// Modified check: accept at least threshold shares.
 	if t < threshold {
 		return nil, errors.New("shamir: insufficient shares provided")
 	} else if t > threshold {
-		// Use first threshold shares if more provided.
 		shares = shares[:threshold]
 		t = threshold
 	}
-
 	xs := make([]byte, t)
 	data := make([][]byte, t)
 	seen := make(map[byte]bool, t)
-
 	for i, buf := range shares {
 		if len(buf) != headLen+secretLen+4 {
 			return nil, errors.New("shamir: share length mismatch")
 		}
-		// CRC check
 		end := len(buf)
 		expected := binary.BigEndian.Uint32(buf[end-4:])
 		if crc32.ChecksumIEEE(buf[:end-4]) != expected {
@@ -231,8 +210,6 @@ func Combine(shares [][]byte) ([]byte, error) {
 		xs[i] = x
 		data[i] = buf[headLen : headLen+secretLen]
 	}
-
-	// compute Lagrange weights
 	prodAll := byte(1)
 	for _, x := range xs {
 		prodAll = mul(prodAll, x)
@@ -250,8 +227,6 @@ func Combine(shares [][]byte) ([]byte, error) {
 		d1, _ := inv(d)
 		lags[i] = mul(mul(prodAll, i1), d1)
 	}
-
-	// reconstruct secret
 	secret := make([]byte, secretLen)
 	for j := 0; j < secretLen; j++ {
 		var v byte
@@ -262,8 +237,6 @@ func Combine(shares [][]byte) ([]byte, error) {
 	}
 	return secret, nil
 }
-
-// --- Storage helpers -------------------------------------------------------
 
 // StoreShares saves all shares to the given storage.
 func StoreShares(shares [][]byte, st IStorage) error {
@@ -303,8 +276,6 @@ func MultiPartyAuthorize(st IStorage, indices []byte, threshold int) ([]byte, er
 func BreakGlassRecovery(st IStorage, indices []byte, threshold int) ([]byte, error) {
 	return MultiPartyAuthorize(st, indices, threshold)
 }
-
-// --- Serialization ---------------------------------------------------------
 
 // EncodeBase64 returns a base64 string of a raw share.
 func EncodeBase64(share []byte) string {
@@ -356,7 +327,6 @@ func FromJSON(js string) ([]byte, error) {
 		return nil, err
 	}
 	secretLen := len(data)
-	const headLen = 4 + 1 + 1 + 1 + 2 + 1
 	buf := make([]byte, headLen+secretLen+4)
 	copy(buf[0:], []byte(magicHeader))
 	buf[4] = version
